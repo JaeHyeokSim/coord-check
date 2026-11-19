@@ -52,6 +52,12 @@ td.c.on{background:var(--done-row)}
 input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;cursor:pointer;margin:0}
 .dup{font-size:11px;font-weight:400;color:var(--muted)}
 body.hide-done .card.complete{display:none}
+.who{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.who input[type=text]{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--surface);color:var(--fg);border-radius:6px;padding:6px 10px;width:140px}
+#syncStat.err{color:#c0392b}
+.hint{margin:24px 0 0;color:var(--muted)}
+body:not(.ready) .grid,body:not(.ready) .total,body:not(.ready) .tools{display:none}
+body.ready .hint{display:none}
 </style>
 <style>*{box-sizing:border-box}body{margin:0;font-size:14px}</style>
 </head>
@@ -59,12 +65,18 @@ body.hide-done .card.complete{display:none}
 
 <header>
   <h1>좌표 체크리스트</h1>
+  <form class="who" id="nickForm">
+    <input type="text" id="nick" placeholder="닉네임" maxlength="20" autocomplete="off" aria-label="닉네임">
+    <button type="submit">불러오기</button>
+    <span class="num" id="syncStat"></span>
+  </form>
   <div class="total"><div class="bar"><i id="totalBar"></i></div><span class="num" id="totalNum">0 / 0</span></div>
   <div class="tools">
     <label class="tg"><input type="checkbox" id="hideDone"> 완료된 번호 숨기기</label>
     <button id="resetAll" class="danger">전체 초기화</button>
   </div>
 </header>
+<p class="hint">닉네임을 입력하고 불러오기를 누르면 체크 상태가 닉네임별로 저장됩니다.</p>
 <div class="grid" id="grid"></div>
 
 <script>
@@ -107,10 +119,57 @@ const RAW = {
 36:["661 276,675 271,691 253,693 272,705 328,708 311,721 292,727 264,727 314,729 294,738 265,738 333"],
 37:["463 325,471 291,486 287,498 343,501 329,511 286,517 358,538 337,544 310,545 345,563 357,576 352"]
 };
-const KEY="coordCheck.v1";
-let state={};
-try{state=JSON.parse(localStorage.getItem(KEY)||"{}")||{}}catch(e){state={}}
-function save(){try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){}}
+/* Firebase Realtime Database 주소. 비우면 이 브라우저에만 닉네임별 저장.
+   예: "https://프로젝트ID-default-rtdb.asia-southeast1.firebasedatabase.app" */
+const DB_URL="";
+const KEY="coordCheck.v1";            // 닉네임 도입 전 저장값(1회 이관 후 삭제)
+const NICK_KEY="coordCheck.nick";
+const CACHE=n=>"coordCheck.u."+n;
+let nick="",state={},pending={},timer=null,reqSeq=0;
+const lsGet=k=>{try{return localStorage.getItem(k)}catch(e){return null}};
+const lsSet=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
+const lsDel=k=>{try{localStorage.removeItem(k)}catch(e){}};
+const parse=s=>{try{return JSON.parse(s)||{}}catch(e){return {}}};
+const isEmpty=o=>!Object.keys(o).length;
+const statEl=document.getElementById("syncStat");
+function stat(t,err){statEl.textContent=t;statEl.classList.toggle("err",!!err)}
+function dbUrl(){return DB_URL.replace(/\/+$/,"")+"/coordCheck/"+encodeURIComponent(nick)+".json"}
+function cache(){lsSet(CACHE(nick),JSON.stringify(state))}
+
+function mark(id,on){
+  if(on)state[id]=1;else delete state[id];
+  pending[id]=on?1:null;cache();
+  if(!DB_URL){pending={};stat("이 브라우저에 저장됨");return}
+  stat("저장 중…");clearTimeout(timer);timer=setTimeout(flush,400);
+}
+async function flush(){
+  const body=pending;pending={};if(isEmpty(body))return;
+  try{
+    const r=await fetch(dbUrl(),{method:"PATCH",body:JSON.stringify(body)});
+    if(!r.ok)throw new Error(r.status);
+    if(isEmpty(pending))stat("저장됨");
+  }catch(e){
+    Object.keys(body).forEach(k=>{if(!(k in pending))pending[k]=body[k]});
+    stat("저장 실패, 재시도 중",1);clearTimeout(timer);timer=setTimeout(flush,3000);
+  }
+}
+async function load(n){
+  nick=n;lsSet(NICK_KEY,n);pending={};clearTimeout(timer);
+  state=parse(lsGet(CACHE(n)));
+  const legacy=parse(lsGet(KEY));
+  if(isEmpty(state)&&!isEmpty(legacy)){state=legacy;cache();lsDel(KEY)}
+  document.body.classList.add("ready");refresh();
+  if(!DB_URL){stat("이 브라우저에 저장됨");return}
+  const seq=++reqSeq;stat("불러오는 중…");
+  try{
+    const r=await fetch(dbUrl());if(!r.ok)throw new Error(r.status);
+    const d=await r.json();if(seq!==reqSeq)return;
+    if(d==null&&!isEmpty(state)){                // 서버에 없고 로컬 기록만 있으면 올림
+      await fetch(dbUrl(),{method:"PUT",body:JSON.stringify(state)});
+    }else{state=d||{};cache();refresh()}
+    stat("불러옴");
+  }catch(e){if(seq===reqSeq)stat("서버 연결 실패, 이 브라우저 기록 표시 중",1)}
+}
 
 const sections=Object.keys(RAW).map(n=>({n:+n,cols:RAW[n].map(s=>s.split(",").map(p=>p.trim().split(/\s+/).map(Number)))}));
 const sig=s=>JSON.stringify(s.cols);
@@ -167,14 +226,14 @@ grid.addEventListener("click",e=>{
     const n=+allBtn.closest(".card").id.slice(4);const s=sections.find(x=>x.n===n);
     const ids=[];s.cols.forEach((col,ci)=>col.forEach((_,r)=>ids.push(ptId(n,ci,r))));
     const allOn=ids.every(i=>state[i]);
-    ids.forEach(i=>{if(allOn)delete state[i];else state[i]=1});
-    save();refresh();return;
+    ids.forEach(i=>mark(i,!allOn));
+    refresh();return;
   }
   const cell=e.target.closest("[data-id]");if(!cell)return;
   const id=cell.dataset.id;
-  if(e.target.matches("input[type=checkbox]")){if(e.target.checked)state[id]=1;else delete state[id]}
-  else{if(state[id])delete state[id];else state[id]=1}
-  save();refresh();
+  if(e.target.matches("input[type=checkbox]"))mark(id,e.target.checked);
+  else mark(id,!state[id]);
+  refresh();
 });
 const hide=document.getElementById("hideDone");
 try{hide.checked=localStorage.getItem(KEY+".hide")==="1"}catch(e){}
@@ -183,9 +242,26 @@ hide.addEventListener("change",()=>{document.body.classList.toggle("hide-done",h
 const rb=document.getElementById("resetAll");let armed=null;
 rb.addEventListener("click",()=>{
   if(!armed){rb.textContent="한 번 더 누르면 초기화";armed=setTimeout(()=>{armed=null;rb.textContent="전체 초기화"},3000);return}
-  clearTimeout(armed);armed=null;rb.textContent="전체 초기화";state={};save();refresh();
+  clearTimeout(armed);armed=null;rb.textContent="전체 초기화";
+  state={};pending={};clearTimeout(timer);cache();refresh();
+  if(DB_URL)fetch(dbUrl(),{method:"DELETE"}).then(r=>stat(r.ok?"초기화됨":"초기화 실패",!r.ok)).catch(()=>stat("초기화 실패",1));
+});
+const nickIn=document.getElementById("nick");
+document.getElementById("nickForm").addEventListener("submit",e=>{
+  e.preventDefault();
+  const n=nickIn.value.trim();
+  if(!n){stat("닉네임을 입력하세요",1);nickIn.focus();return}
+  if(/[.#$\[\]\/]/.test(n)){stat("닉네임에 . # $ [ ] / 는 쓸 수 없습니다",1);return}
+  if(!isEmpty(pending))flush();
+  load(n);
+});
+// 다른 기기에서 바꾼 내용을 탭으로 돌아올 때 반영
+document.addEventListener("visibilitychange",()=>{
+  if(document.visibilityState==="visible"&&nick&&DB_URL&&isEmpty(pending))load(nick);
 });
 render();
+const lastNick=lsGet(NICK_KEY);
+if(lastNick){nickIn.value=lastNick;load(lastNick)}
 </script>
 </body>
 </html>
